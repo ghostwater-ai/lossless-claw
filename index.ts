@@ -1286,34 +1286,42 @@ const lcmPlugin = {
     const lcm = new LcmContextEngine(deps);
 
     api.registerContextEngine("lossless-claw", () => lcm);
-    api.registerTool((ctx) =>
-      createLcmGrepTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+    api.registerTool(
+      (ctx) =>
+        createLcmGrepTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      { name: "lcm_grep" },
     );
-    api.registerTool((ctx) =>
-      createLcmDescribeTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+    api.registerTool(
+      (ctx) =>
+        createLcmDescribeTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      { name: "lcm_describe" },
     );
-    api.registerTool((ctx) =>
-      createLcmExpandTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+    api.registerTool(
+      (ctx) =>
+        createLcmExpandTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      { name: "lcm_expand" },
     );
-    api.registerTool((ctx) =>
-      createLcmExpandQueryTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-        requesterSessionKey: ctx.sessionKey,
-      }),
+    api.registerTool(
+      (ctx) =>
+        createLcmExpandQueryTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+          requesterSessionKey: ctx.sessionKey,
+        }),
+      { name: "lcm_expand_query" },
     );
 
     api.logger.info(
