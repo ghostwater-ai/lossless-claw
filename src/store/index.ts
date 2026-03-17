@@ -11,6 +11,7 @@ export type {
   CreateMessageInput,
   CreateMessagePartInput,
   CreateConversationInput,
+  UpdateConversationMetadataInput,
   MessageSearchInput,
   MessageSearchResult,
 } from "./conversation-store.js";

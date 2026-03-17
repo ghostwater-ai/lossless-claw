@@ -68,6 +68,15 @@ export type MessagePartRecord = {
 export type CreateConversationInput = {
   sessionId: string;
   title?: string;
+  agentScope?: string | null;
+  provider?: string | null;
+  sourceLabel?: string | null;
+};
+
+export type UpdateConversationMetadataInput = {
+  agentScope?: string | null;
+  provider?: string | null;
+  sourceLabel?: string | null;
 };
 
 export type ConversationRecord = {
@@ -75,6 +84,9 @@ export type ConversationRecord = {
   sessionId: string;
   title: string | null;
   bootstrappedAt: Date | null;
+  agentScope: string | null;
+  provider: string | null;
+  sourceLabel: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -104,6 +116,9 @@ interface ConversationRow {
   session_id: string;
   title: string | null;
   bootstrapped_at: string | null;
+  agent_scope: string | null;
+  provider: string | null;
+  source_label: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -157,6 +172,9 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     sessionId: row.session_id,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
+    agentScope: row.agent_scope,
+    provider: row.provider,
+    sourceLabel: row.source_label,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
@@ -231,12 +249,22 @@ export class ConversationStore {
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const result = this.db
-      .prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`)
-      .run(input.sessionId, input.title ?? null);
+      .prepare(
+        `INSERT INTO conversations (session_id, title, agent_scope, provider, source_label)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.sessionId,
+        input.title ?? null,
+        input.agentScope ?? null,
+        input.provider ?? null,
+        input.sourceLabel ?? null,
+      );
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -247,7 +275,8 @@ export class ConversationStore {
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -258,7 +287,8 @@ export class ConversationStore {
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC
@@ -269,12 +299,61 @@ export class ConversationStore {
     return row ? toConversationRecord(row) : null;
   }
 
-  async getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord> {
+  async getOrCreateConversation(
+    sessionId: string,
+    title?: string,
+    metadata?: UpdateConversationMetadataInput,
+  ): Promise<ConversationRecord> {
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
+      if (metadata && this.hasMetadataUpdates(metadata)) {
+        await this.updateConversationMetadata(existing.conversationId, metadata);
+        const refreshed = await this.getConversation(existing.conversationId);
+        return refreshed ?? existing;
+      }
       return existing;
     }
-    return this.createConversation({ sessionId, title });
+    return this.createConversation({
+      sessionId,
+      title,
+      agentScope: metadata?.agentScope,
+      provider: metadata?.provider,
+      sourceLabel: metadata?.sourceLabel,
+    });
+  }
+
+  async updateConversationMetadata(
+    conversationId: ConversationId,
+    input: UpdateConversationMetadataInput,
+  ): Promise<void> {
+    const sets: string[] = [];
+    const args: Array<string | null | number> = [];
+
+    if (input.agentScope !== undefined) {
+      sets.push("agent_scope = ?");
+      args.push(input.agentScope ?? null);
+    }
+    if (input.provider !== undefined) {
+      sets.push("provider = ?");
+      args.push(input.provider ?? null);
+    }
+    if (input.sourceLabel !== undefined) {
+      sets.push("source_label = ?");
+      args.push(input.sourceLabel ?? null);
+    }
+
+    if (sets.length === 0) {
+      return;
+    }
+
+    sets.push("updated_at = datetime('now')");
+    this.db
+      .prepare(
+        `UPDATE conversations
+         SET ${sets.join(", ")}
+         WHERE conversation_id = ?`,
+      )
+      .run(...args, conversationId);
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -286,6 +365,14 @@ export class ConversationStore {
        WHERE conversation_id = ?`,
       )
       .run(conversationId);
+  }
+
+  private hasMetadataUpdates(input: UpdateConversationMetadataInput): boolean {
+    return (
+      input.agentScope !== undefined ||
+      input.provider !== undefined ||
+      input.sourceLabel !== undefined
+    );
   }
 
   // ── Message operations ────────────────────────────────────────────────────

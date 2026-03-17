@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
 
 const tempDirs: string[] = [];
 
@@ -208,6 +209,108 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_1")).toBe(15);
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_2")).toBe(15);
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
+  });
+
+  it("adds cross-session metadata columns and digest table for legacy databases", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "legacy-cross-session.db");
+    const db = getLcmConnection(dbPath);
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(conversationColumns.some((column) => column.name === "bootstrapped_at")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "agent_scope")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "provider")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "source_label")).toBe(true);
+
+    const digestColumns = db.prepare(`PRAGMA table_info(conversation_digests)`).all() as Array<{
+      name?: string;
+    }>;
+    const digestColumnNames = new Set(digestColumns.map((column) => column.name));
+    expect(digestColumnNames.has("conversation_id")).toBe(true);
+    expect(digestColumnNames.has("agent_scope")).toBe(true);
+    expect(digestColumnNames.has("provider")).toBe(true);
+    expect(digestColumnNames.has("source_label")).toBe(true);
+    expect(digestColumnNames.has("digest_text")).toBe(true);
+    expect(digestColumnNames.has("token_count")).toBe(true);
+    expect(digestColumnNames.has("last_context_ord")).toBe(true);
+    expect(digestColumnNames.has("earliest_at")).toBe(true);
+    expect(digestColumnNames.has("latest_at")).toBe(true);
+    expect(digestColumnNames.has("updated_at")).toBe(true);
+
+    db.prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`).run(
+      "legacy-cross-session",
+      "Legacy",
+    );
+    db.prepare(
+      `INSERT INTO conversation_digests (
+         conversation_id, agent_scope, provider, source_label, digest_text,
+         token_count, last_context_ord, earliest_at, latest_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(1, "cpto", "slack", "#openclaw-fork", "digest", 120, 4, "2026-01-01", "2026-01-02");
+
+    expect(() => {
+      db.prepare(
+        `INSERT INTO conversation_digests (
+           conversation_id, agent_scope, provider, source_label, digest_text,
+           token_count, last_context_ord, earliest_at, latest_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(1, "cpto", "slack", "#openclaw-fork", "digest-2", 110, 5, "2026-01-01", "2026-01-03");
+    }).toThrow();
+  });
+
+  it("round-trips conversation metadata and updates existing conversation fields", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "conversation-metadata.db");
+    const db = getLcmConnection(dbPath);
+    runLcmMigrations(db, { fts5Available: false });
+
+    const store = new ConversationStore(db, { fts5Available: false });
+    const created = await store.createConversation({
+      sessionId: "agent:cpto:session-1",
+      title: "Cross-session test",
+      agentScope: "cpto",
+      provider: "slack",
+      sourceLabel: "#openclaw-fork",
+    });
+
+    expect(created.agentScope).toBe("cpto");
+    expect(created.provider).toBe("slack");
+    expect(created.sourceLabel).toBe("#openclaw-fork");
+
+    await store.updateConversationMetadata(created.conversationId, {
+      provider: "discord",
+      sourceLabel: "DM: James",
+    });
+
+    const updated = await store.getConversation(created.conversationId);
+    expect(updated).not.toBeNull();
+    expect(updated?.agentScope).toBe("cpto");
+    expect(updated?.provider).toBe("discord");
+    expect(updated?.sourceLabel).toBe("DM: James");
+
+    const existing = await store.getOrCreateConversation("agent:cpto:session-1", undefined, {
+      agentScope: "cpto-updated",
+    });
+    expect(existing.conversationId).toBe(created.conversationId);
+    expect(existing.agentScope).toBe("cpto-updated");
+    expect(existing.provider).toBe("discord");
+    expect(existing.sourceLabel).toBe("DM: James");
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
