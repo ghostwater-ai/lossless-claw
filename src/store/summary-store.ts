@@ -52,6 +52,13 @@ export type ContextItemRecord = {
   createdAt: Date;
 };
 
+export type ContextDigestSourceItem = {
+  ordinal: number;
+  itemType: ContextItemType;
+  content: string;
+  createdAt: Date;
+};
+
 export type SummarySearchInput = {
   conversationId?: number;
   query: string;
@@ -122,6 +129,13 @@ interface ContextItemRow {
   item_type: ContextItemType;
   message_id: number | null;
   summary_id: string | null;
+  created_at: string;
+}
+
+interface ContextDigestSourceRow {
+  ordinal: number;
+  item_type: ContextItemType;
+  content: string | null;
   created_at: string;
 }
 
@@ -209,6 +223,15 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toContextDigestSourceItem(row: ContextDigestSourceRow): ContextDigestSourceItem {
+  return {
+    ordinal: row.ordinal,
+    itemType: row.item_type,
+    content: row.content ?? "",
     createdAt: new Date(row.created_at),
   };
 }
@@ -518,6 +541,31 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as ContextItemRow[];
     return rows.map(toContextItemRecord);
+  }
+
+  async getContextItemsSinceOrdinal(
+    conversationId: number,
+    lastContextOrdinalInclusive: number,
+  ): Promise<ContextDigestSourceItem[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT
+         ci.ordinal,
+         ci.item_type,
+         CASE
+           WHEN ci.item_type = 'message' THEN m.content
+           ELSE s.content
+         END AS content,
+         ci.created_at
+       FROM context_items ci
+       LEFT JOIN messages m ON m.message_id = ci.message_id
+       LEFT JOIN summaries s ON s.summary_id = ci.summary_id
+       WHERE ci.conversation_id = ?
+         AND ci.ordinal > ?
+       ORDER BY ci.ordinal`,
+      )
+      .all(conversationId, lastContextOrdinalInclusive) as unknown as ContextDigestSourceRow[];
+    return rows.map(toContextDigestSourceItem);
   }
 
   async getDistinctDepthsInContext(

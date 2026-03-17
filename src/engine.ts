@@ -39,11 +39,20 @@ import {
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
+import { createLcmSummarizeFromLegacyParams, type LcmSummarizeOptions } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
+
+const BEACON_TARGET_TOKENS = 140;
+const BEACON_HARD_TOKEN_CAP = 180;
+const BEACON_SUMMARIZER_INSTRUCTIONS = [
+  "Produce an ambient relevance beacon for cross-session routing.",
+  "Keep it concise and discriminative, not a narrative retelling.",
+  "Include topic/project identity, latest direction change, and one key decision/blocker/open question.",
+  "Aim for 120-160 tokens. Do not exceed ~180 tokens.",
+].join(" ");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -571,6 +580,32 @@ function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number
   return total;
 }
 
+function truncateBeaconToTokenCap(text: string, tokenCap: number): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (estimateTokens(trimmed) <= tokenCap) {
+    return trimmed;
+  }
+
+  const maxChars = Math.max(1, tokenCap * 4);
+  return trimmed.slice(0, maxChars).trimEnd();
+}
+
+function formatDigestSourceItems(
+  items: Array<{ ordinal: number; itemType: "message" | "summary"; content: string; createdAt: Date }>,
+): string {
+  return items
+    .map((item) => {
+      const stamp = item.createdAt.toISOString();
+      const kind = item.itemType === "summary" ? "summary" : "message";
+      return `[ord:${item.ordinal}] [${kind}] [${stamp}]\n${item.content}`;
+    })
+    .join("\n\n");
+}
+
 function isBootstrapMessage(value: unknown): value is AgentMessage {
   if (!value || typeof value !== "object") {
     return false;
@@ -799,10 +834,16 @@ export class LcmContextEngine implements ContextEngine {
   private async resolveSummarize(params: {
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
-  }): Promise<(text: string, aggressive?: boolean) => Promise<string>> {
+  }): Promise<
+    (text: string, aggressive?: boolean, options?: LcmSummarizeOptions) => Promise<string>
+  > {
     const lp = params.legacyParams ?? {};
     if (typeof lp.summarize === "function") {
-      return lp.summarize as (text: string, aggressive?: boolean) => Promise<string>;
+      return lp.summarize as (
+        text: string,
+        aggressive?: boolean,
+        options?: LcmSummarizeOptions,
+      ) => Promise<string>;
     }
     try {
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
@@ -862,6 +903,100 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       return undefined;
     }
+  }
+
+  private resolveBeaconMetadata(params: {
+    sessionId: string;
+    conversationAgentScope: string | null;
+    conversationProvider: string | null;
+    conversationSourceLabel: string | null;
+    legacyParams?: Record<string, unknown>;
+  }): { agentScope: string; provider: string | null; sourceLabel: string | null } {
+    const lp = params.legacyParams ?? {};
+    const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+
+    const agentScope =
+      params.conversationAgentScope ??
+      safeString(lp.agentScope) ??
+      safeString(lp.agent_scope) ??
+      safeString(lp.agentId) ??
+      safeString(lp.agent_id) ??
+      (parsed ? this.deps.normalizeAgentId(parsed.agentId) : this.deps.normalizeAgentId(undefined));
+    const provider =
+      params.conversationProvider ??
+      safeString(lp.provider) ??
+      safeString(lp.sessionProvider) ??
+      safeString(lp.session_provider) ??
+      null;
+    const sourceLabel =
+      params.conversationSourceLabel ??
+      safeString(lp.sourceLabel) ??
+      safeString(lp.source_label) ??
+      safeString(lp.channelLabel) ??
+      safeString(lp.channel_label) ??
+      (parsed ? parsed.suffix : null);
+
+    return {
+      agentScope: this.deps.normalizeAgentId(agentScope),
+      provider,
+      sourceLabel,
+    };
+  }
+
+  private async updateDigest(params: {
+    conversationId: number;
+    sessionId: string;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<void> {
+    const conversation = await this.conversationStore.getConversation(params.conversationId);
+    if (!conversation) {
+      return;
+    }
+
+    const metadata = this.resolveBeaconMetadata({
+      sessionId: params.sessionId,
+      conversationAgentScope: conversation.agentScope,
+      conversationProvider: conversation.provider,
+      conversationSourceLabel: conversation.sourceLabel,
+      legacyParams: params.legacyParams,
+    });
+    const existing = await this.conversationStore.getConversationDigest(params.conversationId);
+    const newItems = await this.summaryStore.getContextItemsSinceOrdinal(
+      params.conversationId,
+      existing?.lastContextOrd ?? -1,
+    );
+    if (newItems.length === 0) {
+      return;
+    }
+
+    const summarize = await this.resolveSummarize({
+      legacyParams: params.legacyParams,
+      customInstructions: BEACON_SUMMARIZER_INSTRUCTIONS,
+    });
+    const digestInput = formatDigestSourceItems(newItems);
+    const digestText = truncateBeaconToTokenCap(
+      await summarize(digestInput, false, {
+        previousSummary: existing?.digestText,
+        purpose: "beacon",
+        targetTokens: BEACON_TARGET_TOKENS,
+        hardTokenCap: BEACON_HARD_TOKEN_CAP,
+      }),
+      BEACON_HARD_TOKEN_CAP,
+    );
+
+    const latestItem = newItems[newItems.length - 1];
+    const maxOrdinal = latestItem.ordinal;
+    await this.conversationStore.upsertConversationDigest({
+      conversationId: params.conversationId,
+      agentScope: metadata.agentScope,
+      provider: metadata.provider,
+      sourceLabel: metadata.sourceLabel,
+      digestText,
+      tokenCount: estimateTokens(digestText),
+      lastContextOrd: maxOrdinal,
+      earliestAt: existing?.earliestAt ?? newItems[0].createdAt,
+      latestAt: latestItem.createdAt,
+    });
   }
 
   /** Persist intercepted large-file text payloads to ~/.openclaw/lcm-files. */
@@ -1330,42 +1465,54 @@ export class LcmContextEngine implements ContextEngine {
       params.tokenBudget > 0
         ? Math.floor(params.tokenBudget)
         : undefined;
-    if (!tokenBudget) {
-      return;
-    }
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
 
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
-    try {
-      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId);
-      if (leafTrigger.shouldCompact) {
-        this.compactLeafAsync({
+    if (tokenBudget) {
+      try {
+        const leafTrigger = await this.evaluateLeafTrigger(params.sessionId);
+        if (leafTrigger.shouldCompact) {
+          this.compactLeafAsync({
+            sessionId: params.sessionId,
+            sessionFile: params.sessionFile,
+            tokenBudget,
+            currentTokenCount: liveContextTokens,
+            legacyParams,
+          }).catch(() => {
+            // Leaf compaction is best-effort and should not fail the caller.
+          });
+        }
+      } catch {
+        // Leaf trigger checks are best-effort.
+      }
+
+      try {
+        await this.compact({
           sessionId: params.sessionId,
           sessionFile: params.sessionFile,
           tokenBudget,
           currentTokenCount: liveContextTokens,
+          compactionTarget: "threshold",
           legacyParams,
-        }).catch(() => {
-          // Leaf compaction is best-effort and should not fail the caller.
         });
+      } catch {
+        // Proactive compaction is best-effort in the post-turn lifecycle.
       }
-    } catch {
-      // Leaf trigger checks are best-effort.
     }
 
     try {
-      await this.compact({
-        sessionId: params.sessionId,
-        sessionFile: params.sessionFile,
-        tokenBudget,
-        currentTokenCount: liveContextTokens,
-        compactionTarget: "threshold",
-        legacyParams,
-      });
+      const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
+      if (conversation) {
+        await this.updateDigest({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          legacyParams,
+        });
+      }
     } catch {
-      // Proactive compaction is best-effort in the post-turn lifecycle.
+      // Digest refresh is best-effort in the post-turn lifecycle.
     }
   }
 

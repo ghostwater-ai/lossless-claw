@@ -91,6 +91,31 @@ export type ConversationRecord = {
   updatedAt: Date;
 };
 
+export type ConversationDigestRecord = {
+  conversationId: ConversationId;
+  agentScope: string;
+  provider: string | null;
+  sourceLabel: string | null;
+  digestText: string;
+  tokenCount: number;
+  lastContextOrd: number;
+  earliestAt: Date | null;
+  latestAt: Date | null;
+  updatedAt: Date;
+};
+
+export type UpsertConversationDigestInput = {
+  conversationId: ConversationId;
+  agentScope: string;
+  provider?: string | null;
+  sourceLabel?: string | null;
+  digestText: string;
+  tokenCount: number;
+  lastContextOrd: number;
+  earliestAt?: Date | null;
+  latestAt?: Date | null;
+};
+
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   query: string;
@@ -120,6 +145,19 @@ interface ConversationRow {
   provider: string | null;
   source_label: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+interface ConversationDigestRow {
+  conversation_id: number;
+  agent_scope: string;
+  provider: string | null;
+  source_label: string | null;
+  digest_text: string;
+  token_count: number;
+  last_context_ord: number;
+  earliest_at: string | null;
+  latest_at: string | null;
   updated_at: string;
 }
 
@@ -176,6 +214,21 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     provider: row.provider,
     sourceLabel: row.source_label,
     createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+function toConversationDigestRecord(row: ConversationDigestRow): ConversationDigestRecord {
+  return {
+    conversationId: row.conversation_id,
+    agentScope: row.agent_scope,
+    provider: row.provider,
+    sourceLabel: row.source_label,
+    digestText: row.digest_text,
+    tokenCount: row.token_count,
+    lastContextOrd: row.last_context_ord,
+    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
+    latestAt: row.latest_at ? new Date(row.latest_at) : null,
     updatedAt: new Date(row.updated_at),
   };
 }
@@ -365,6 +418,75 @@ export class ConversationStore {
        WHERE conversation_id = ?`,
       )
       .run(conversationId);
+  }
+
+  async getConversationDigest(
+    conversationId: ConversationId,
+  ): Promise<ConversationDigestRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as ConversationDigestRow | undefined;
+    return row ? toConversationDigestRecord(row) : null;
+  }
+
+  async upsertConversationDigest(
+    input: UpsertConversationDigestInput,
+  ): Promise<ConversationDigestRecord> {
+    const earliestAt = input.earliestAt instanceof Date ? input.earliestAt.toISOString() : null;
+    const latestAt = input.latestAt instanceof Date ? input.latestAt.toISOString() : null;
+
+    this.db
+      .prepare(
+        `INSERT INTO conversation_digests (
+          conversation_id,
+          agent_scope,
+          provider,
+          source_label,
+          digest_text,
+          token_count,
+          last_context_ord,
+          earliest_at,
+          latest_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT (conversation_id) DO UPDATE SET
+          agent_scope = excluded.agent_scope,
+          provider = excluded.provider,
+          source_label = excluded.source_label,
+          digest_text = excluded.digest_text,
+          token_count = excluded.token_count,
+          last_context_ord = excluded.last_context_ord,
+          earliest_at = excluded.earliest_at,
+          latest_at = excluded.latest_at,
+          updated_at = datetime('now')`,
+      )
+      .run(
+        input.conversationId,
+        input.agentScope,
+        input.provider ?? null,
+        input.sourceLabel ?? null,
+        input.digestText,
+        Math.max(0, Math.floor(input.tokenCount)),
+        Math.max(0, Math.floor(input.lastContextOrd)),
+        earliestAt,
+        latestAt,
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE conversation_id = ?`,
+      )
+      .get(input.conversationId) as unknown as ConversationDigestRow;
+
+    return toConversationDigestRecord(row);
   }
 
   private hasMetadataUpdates(input: UpdateConversationMetadataInput): boolean {

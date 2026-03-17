@@ -119,6 +119,19 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
   return new LcmContextEngine(createTestDeps(config));
 }
 
+function createEngineWithDeps(
+  overrides?: Partial<LcmConfig>,
+): { engine: LcmContextEngine; deps: LcmDependencies } {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...(overrides ?? {}),
+  };
+  const deps = createTestDeps(config);
+  return { engine: new LcmContextEngine(deps), deps };
+}
+
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
   const tempHome = mkdtempSync(join(tmpdir(), "lossless-claw-home-"));
@@ -1740,6 +1753,158 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
       runtimeContext,
     );
+  });
+
+  it("afterTurn runs digest update after threshold compaction flow", async () => {
+    const { engine } = createEngineWithDeps();
+    const sessionId = "after-turn-digest-order";
+    const callOrder: string[] = [];
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(engine, "compact").mockImplementation(async () => {
+      callOrder.push("compact");
+      return {
+        ok: true,
+        compacted: false,
+        reason: "below threshold",
+      };
+    });
+    vi.spyOn(engine as unknown as { updateDigest: (...args: unknown[]) => Promise<void> }, "updateDigest")
+      .mockImplementation(async () => {
+        callOrder.push("digest");
+      });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-order"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(callOrder).toEqual(["compact", "digest"]);
+  });
+
+  it("creates an initial ambient digest beacon from scratch", async () => {
+    const { engine, deps } = createEngineWithDeps();
+    const sessionId = "after-turn-digest-initial";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-initial"),
+      messages: [makeMessage({ role: "assistant", content: "initial work item" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "cpto",
+        provider: "slack",
+        sourceLabel: "#ops",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(0);
+    expect(digest!.agentScope).toBe("cpto");
+    expect(digest!.provider).toBe("slack");
+    expect(digest!.sourceLabel).toBe("#ops");
+    expect(digest!.tokenCount).toBeGreaterThan(0);
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    expect(completeMock).toHaveBeenCalledTimes(1);
+    const prompt = (completeMock.mock.calls[0]?.[0] as { messages?: Array<{ content?: unknown }> })
+      .messages?.[0]?.content;
+    expect(typeof prompt).toBe("string");
+    expect(prompt as string).toContain("ambient cross-session relevance beacon");
+    expect(prompt as string).toContain("Target length: 120-160 tokens. Hard cap: 180 tokens.");
+  });
+
+  it("updates digest incrementally using only context added after last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps();
+    const sessionId = "after-turn-digest-incremental";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-incremental-1"),
+      messages: [makeMessage({ role: "assistant", content: "first update" })],
+      prePromptMessageCount: 0,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-incremental-2"),
+      messages: [makeMessage({ role: "assistant", content: "second update" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(1);
+    expect(digest!.earliestAt).not.toBeNull();
+    expect(digest!.latestAt).not.toBeNull();
+    expect((digest!.latestAt as Date).getTime()).toBeGreaterThanOrEqual(
+      (digest!.earliestAt as Date).getTime(),
+    );
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    expect(completeMock).toHaveBeenCalledTimes(2);
+    const secondPrompt = (
+      completeMock.mock.calls[1]?.[0] as { messages?: Array<{ content?: unknown }> }
+    ).messages?.[0]?.content;
+    expect(typeof secondPrompt).toBe("string");
+    expect(secondPrompt as string).toContain("<previous_beacon>");
+    expect(secondPrompt as string).toContain("[ord:1]");
+    expect(secondPrompt as string).not.toContain("[ord:0]");
+  });
+
+  it("skips digest regeneration when no context items exist beyond last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps();
+    const sessionId = "after-turn-digest-noop";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-noop"),
+      messages: [makeMessage({ role: "assistant", content: "seed digest" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const before = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(before).not.toBeNull();
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    const callCountBefore = completeMock.mock.calls.length;
+
+    await (engine as unknown as { updateDigest: (input: unknown) => Promise<void> }).updateDigest({
+      conversationId: conversation!.conversationId,
+      sessionId,
+      legacyParams: undefined,
+    });
+
+    const after = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(after).not.toBeNull();
+    expect(completeMock.mock.calls.length).toBe(callCountBefore);
+    expect(after!.digestText).toBe(before!.digestText);
+    expect(after!.updatedAt.getTime()).toBe(before!.updatedAt.getTime());
   });
 });
 
