@@ -1253,6 +1253,129 @@ describe("LcmContextEngine.assemble canonical path", () => {
       expected.systemPromptAddition,
     );
   });
+
+  it("keeps assembly byte-equivalent to same-session output when cross-session is disabled", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: false,
+        totalBudget: 220,
+      },
+    });
+    const sessionId = "ambient-disabled-budget";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "alpha" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "beta" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const expected = await new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+    ).assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 600,
+      freshTailCount: 8,
+    });
+    const actual = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 600,
+    });
+
+    expect(JSON.stringify(actual.messages)).toBe(JSON.stringify(expected.messages));
+    expect(actual.estimatedTokens).toBe(expected.estimatedTokens);
+    expect((actual as { systemPromptAddition?: string }).systemPromptAddition).toBe(
+      expected.systemPromptAddition,
+    );
+  });
+
+  it("shows prior-session ambient beacons after reset only when cross-session is enabled", async () => {
+    const runtimeContext = {
+      agentScope: "agent-reset",
+      provider: "slack",
+      sourceLabel: "#standup",
+    };
+    const oldSessionId = "agent:agent-reset:before-reset";
+    const newSessionId = "agent:agent-reset:after-reset";
+
+    const enabledEngine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    await enabledEngine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("before-reset-enabled"),
+      messages: [makeMessage({ role: "assistant", content: "old-session project tracker updates" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await enabledEngine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("after-reset-enabled"),
+      messages: [makeMessage({ role: "assistant", content: "new-session kickoff after reset" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const enabledResult = await enabledEngine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const enabledAmbient = enabledResult.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(enabledAmbient).toHaveLength(1);
+    expect(enabledAmbient[0]).toContain("summary output");
+    expect(enabledAmbient[0]).toContain('source_label="#standup"');
+
+    const disabledEngine = createEngineWithConfig({
+      crossSession: {
+        enabled: false,
+        totalBudget: 400,
+      },
+    });
+    await disabledEngine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("before-reset-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "old-session project tracker updates" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await disabledEngine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("after-reset-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "new-session kickoff after reset" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const disabledResult = await disabledEngine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const disabledAmbient = disabledResult.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(disabledAmbient).toHaveLength(0);
+  });
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {

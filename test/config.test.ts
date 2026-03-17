@@ -144,4 +144,11 @@ describe("resolveLcmConfig", () => {
   it("ships a manifest that accepts unlimited incremental depth", () => {
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
   });
+
+  it("ships a manifest that accepts cross-session config", () => {
+    const crossSessionSchema = manifest.configSchema.properties.crossSession;
+    expect(crossSessionSchema.properties.enabled.type).toBe("boolean");
+    expect(crossSessionSchema.properties.totalBudget.type).toBe("integer");
+    expect(crossSessionSchema.properties.totalBudget.minimum).toBe(0);
+  });
 });
