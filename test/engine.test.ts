@@ -2064,7 +2064,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn runs digest update after threshold compaction flow", async () => {
-    const { engine } = createEngineWithDeps();
+    const { engine } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
     const sessionId = "after-turn-digest-order";
     const callOrder: string[] = [];
 
@@ -2097,8 +2102,123 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(callOrder).toEqual(["compact", "digest"]);
   });
 
+  it("afterTurn skips digest update when cross-session is disabled", async () => {
+    const { engine } = createEngineWithDeps({
+      crossSession: {
+        enabled: false,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-disabled";
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const digestSpy = vi.spyOn(
+      engine as unknown as { updateDigest: (...args: unknown[]) => Promise<void> },
+      "updateDigest",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(digestSpy).not.toHaveBeenCalled();
+  });
+
+  it("afterTurn syncs conversation metadata from runtimeContext for plain session ids", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-sync";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-sync"),
+      messages: [makeMessage({ role: "assistant", content: "metadata seed turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-metadata",
+        provider: "slack",
+        sourceLabel: "#alerts",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-metadata");
+    expect(conversation!.provider).toBe("slack");
+    expect(conversation!.sourceLabel).toBe("#alerts");
+  });
+
+  it("escapes ambient beacon attribute values", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    const oldSessionId = "escape-attrs-old";
+    const newSessionId = "escape-attrs-new";
+    const runtimeContext = {
+      agentScope: "agent-escape",
+      provider: 'acme "ops" & triage',
+      sourceLabel: 'channel <critical> "p1"',
+    };
+
+    await engine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("escape-attrs-old"),
+      messages: [makeMessage({ role: "assistant", content: "prior context for beacon" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await engine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("escape-attrs-new"),
+      messages: [makeMessage({ role: "assistant", content: "current turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const ambient = assembled.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(1);
+    expect(ambient[0]).toContain('provider="acme &quot;ops&quot; &amp; triage"');
+    expect(ambient[0]).toContain('source_label="channel &lt;critical&gt; &quot;p1&quot;"');
+  });
+
   it("creates an initial ambient digest beacon from scratch", async () => {
-    const { engine, deps } = createEngineWithDeps();
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
     const sessionId = "after-turn-digest-initial";
 
     await engine.afterTurn({
@@ -2136,7 +2256,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("updates digest incrementally using only context added after last_context_ord", async () => {
-    const { engine, deps } = createEngineWithDeps();
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
     const sessionId = "after-turn-digest-incremental";
 
     await engine.afterTurn({
@@ -2179,7 +2304,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("skips digest regeneration when no context items exist beyond last_context_ord", async () => {
-    const { engine, deps } = createEngineWithDeps();
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
     const sessionId = "after-turn-digest-noop";
 
     await engine.afterTurn({

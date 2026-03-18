@@ -66,9 +66,17 @@ function formatAmbientTimestamp(date: Date | null): string {
   return date ? date.toISOString() : "unknown";
 }
 
+function escapeXmlAttr(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function formatAmbientBeaconBlock(digest: ConversationDigestRecord): string {
-  const provider = digest.provider ?? "unknown";
-  const sourceLabel = digest.sourceLabel ?? "unknown";
+  const provider = escapeXmlAttr(digest.provider ?? "unknown");
+  const sourceLabel = escapeXmlAttr(digest.sourceLabel ?? "unknown");
   const latestAt = formatAmbientTimestamp(digest.latestAt);
   return [
     `<ambient_beacon provider="${provider}" source_label="${sourceLabel}" latest_at="${latestAt}">`,
@@ -959,6 +967,24 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
+  private async syncConversationMetadata(params: {
+    sessionId: string;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<void> {
+    const metadata = this.resolveBeaconMetadata({
+      sessionId: params.sessionId,
+      conversationAgentScope: null,
+      conversationProvider: null,
+      conversationSourceLabel: null,
+      legacyParams: params.legacyParams,
+    });
+    await this.conversationStore.getOrCreateConversation(params.sessionId, undefined, {
+      agentScope: metadata.agentScope,
+      provider: metadata.provider,
+      sourceLabel: metadata.sourceLabel,
+    });
+  }
+
   private async updateDigest(params: {
     conversationId: number;
     sessionId: string;
@@ -1484,6 +1510,15 @@ export class LcmContextEngine implements ContextEngine {
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
 
+    try {
+      await this.syncConversationMetadata({
+        sessionId: params.sessionId,
+        legacyParams,
+      });
+    } catch {
+      // Metadata sync is best-effort in the post-turn lifecycle.
+    }
+
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     if (tokenBudget) {
@@ -1518,17 +1553,19 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    try {
-      const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
-      if (conversation) {
-        await this.updateDigest({
-          conversationId: conversation.conversationId,
-          sessionId: params.sessionId,
-          legacyParams,
-        });
+    if (this.config.crossSession.enabled === true) {
+      try {
+        const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
+        if (conversation) {
+          await this.updateDigest({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            legacyParams,
+          });
+        }
+      } catch {
+        // Digest refresh is best-effort in the post-turn lifecycle.
       }
-    } catch {
-      // Digest refresh is best-effort in the post-turn lifecycle.
     }
   }
 
