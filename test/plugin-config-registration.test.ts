@@ -184,6 +184,29 @@ describe("lcm plugin registration", () => {
     });
   });
 
+  it("stores plugin cross-session config in resolved LCM config", () => {
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      crossSession: {
+        enabled: true,
+        totalBudget: 2048,
+      },
+    });
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { config: Record<string, unknown> };
+    expect(engine.config).toMatchObject({
+      crossSession: {
+        enabled: true,
+        totalBudget: 2048,
+      },
+    });
+  });
+
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
       {

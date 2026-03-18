@@ -35,6 +35,10 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    crossSession: {
+      enabled: false,
+      totalBudget: 6000,
+    },
   };
 }
 
@@ -117,6 +121,19 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
     ...overrides,
   };
   return new LcmContextEngine(createTestDeps(config));
+}
+
+function createEngineWithDeps(
+  overrides?: Partial<LcmConfig>,
+): { engine: LcmContextEngine; deps: LcmDependencies } {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...(overrides ?? {}),
+  };
+  const deps = createTestDeps(config);
+  return { engine: new LcmContextEngine(deps), deps };
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -1055,6 +1072,414 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("Do not guess");
     expect(promptAddition).toContain("Expand first or state that you need to expand");
   });
+
+  it("injects ambient beacons in recency order with budget cutoff and agent isolation", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 220,
+      },
+    });
+    const scopeA = "agent-a";
+    const scopeB = "agent-b";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:current",
+      sessionFile: createSessionFilePath("ambient-current"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "slack", sourceLabel: "#current" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:recent-1",
+      sessionFile: createSessionFilePath("ambient-r1"),
+      messages: [makeMessage({ role: "assistant", content: "recent one content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "discord", sourceLabel: "#recent-1" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:recent-2",
+      sessionFile: createSessionFilePath("ambient-r2"),
+      messages: [makeMessage({ role: "assistant", content: "recent two content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "telegram", sourceLabel: "DM: Two" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:oldest",
+      sessionFile: createSessionFilePath("ambient-oldest"),
+      messages: [makeMessage({ role: "assistant", content: "oldest content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "email", sourceLabel: "old-mailbox" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-b:foreign",
+      sessionFile: createSessionFilePath("ambient-foreign"),
+      messages: [makeMessage({ role: "assistant", content: "foreign content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeB, provider: "slack", sourceLabel: "#foreign" },
+    });
+
+    const store = engine.getConversationStore();
+    const current = await store.getConversationBySessionId("agent:agent-a:current");
+    const recent1 = await store.getConversationBySessionId("agent:agent-a:recent-1");
+    const recent2 = await store.getConversationBySessionId("agent:agent-a:recent-2");
+    const oldest = await store.getConversationBySessionId("agent:agent-a:oldest");
+    const foreign = await store.getConversationBySessionId("agent:agent-b:foreign");
+    expect(current).not.toBeNull();
+    expect(recent1).not.toBeNull();
+    expect(recent2).not.toBeNull();
+    expect(oldest).not.toBeNull();
+    expect(foreign).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: recent1!.conversationId,
+      agentScope: scopeA,
+      provider: "discord",
+      sourceLabel: "#recent-1",
+      digestText: "recent-one ".repeat(15).trim(),
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:00:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: recent2!.conversationId,
+      agentScope: scopeA,
+      provider: "telegram",
+      sourceLabel: "DM: Two",
+      digestText: "recent-two ".repeat(15).trim(),
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T10:00:00.000Z"),
+      latestAt: new Date("2026-03-17T09:00:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: oldest!.conversationId,
+      agentScope: scopeA,
+      provider: "email",
+      sourceLabel: "old-mailbox",
+      digestText: "oldest ".repeat(60).trim(),
+      tokenCount: 60,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-14T09:00:00.000Z"),
+      latestAt: new Date("2026-03-14T09:30:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: foreign!.conversationId,
+      agentScope: scopeB,
+      provider: "slack",
+      sourceLabel: "#foreign",
+      digestText: "foreign ".repeat(60).trim(),
+      tokenCount: 60,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-17T08:00:00.000Z"),
+      latestAt: new Date("2026-03-17T10:00:00.000Z"),
+    });
+
+    const result = await engine.assemble({
+      sessionId: "agent:agent-a:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+
+    const ambient = result.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(2);
+    expect(ambient[0]).toContain('provider="telegram"');
+    expect(ambient[0]).toContain('source_label="DM: Two"');
+    expect(ambient[1]).toContain('provider="discord"');
+    expect(ambient[1]).toContain('source_label="#recent-1"');
+    expect(ambient[0]).toContain('latest_at="2026-03-17T09:00:00.000Z"');
+    expect(ambient[1]).toContain('latest_at="2026-03-16T09:00:00.000Z"');
+    expect(ambient.join("\n")).not.toContain("old-mailbox");
+    expect(ambient.join("\n")).not.toContain("#foreign");
+    expect(ambient.join("\n")).toContain("recent-two recent-two");
+
+    const firstAmbientIndex = result.messages.findIndex(
+      (message: AgentMessage) =>
+        message.role === "user" &&
+        typeof message.content === "string" &&
+        message.content.startsWith("<ambient_beacon "),
+    );
+    expect(firstAmbientIndex).toBeGreaterThan(0);
+  });
+
+  it("continues packing ambient beacons after skipping an oversized recent beacon", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 220,
+      },
+    });
+    const scope = "agent-pack";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:current",
+      sessionFile: createSessionFilePath("ambient-pack-current"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "slack", sourceLabel: "#current" },
+    });
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:oversized",
+      sessionFile: createSessionFilePath("ambient-pack-oversized"),
+      messages: [makeMessage({ role: "assistant", content: "oversized source" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "email", sourceLabel: "too-large" },
+    });
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:small",
+      sessionFile: createSessionFilePath("ambient-pack-small"),
+      messages: [makeMessage({ role: "assistant", content: "small source" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "discord", sourceLabel: "fits" },
+    });
+
+    const store = engine.getConversationStore();
+    const oversized = await store.getConversationBySessionId("agent:agent-pack:oversized");
+    const small = await store.getConversationBySessionId("agent:agent-pack:small");
+    expect(oversized).not.toBeNull();
+    expect(small).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: oversized!.conversationId,
+      agentScope: scope,
+      provider: "email",
+      sourceLabel: "too-large",
+      digestText: "oversized ".repeat(200).trim(),
+      tokenCount: 200,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-17T09:00:00.000Z"),
+      latestAt: new Date("2026-03-17T09:01:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: small!.conversationId,
+      agentScope: scope,
+      provider: "discord",
+      sourceLabel: "fits",
+      digestText: "small ".repeat(8).trim(),
+      tokenCount: 8,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-16T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:01:00.000Z"),
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: "agent:agent-pack:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+    const ambient = assembled.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(1);
+    expect(ambient[0]).toContain('source_label="fits"');
+    expect(ambient.join("\n")).not.toContain("too-large");
+  });
+
+  it("keeps assembly byte-equivalent to same-session output when ambient budget is zero", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 0,
+      },
+    });
+    const sessionId = "ambient-zero-budget";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "alpha" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "beta" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const expected = await new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+    ).assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 600,
+      freshTailCount: 8,
+    });
+    const actual = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 600,
+    });
+
+    expect(JSON.stringify(actual.messages)).toBe(JSON.stringify(expected.messages));
+    expect(actual.estimatedTokens).toBe(expected.estimatedTokens);
+    expect((actual as { systemPromptAddition?: string }).systemPromptAddition).toBe(
+      expected.systemPromptAddition,
+    );
+  });
+
+  it("reserves at least one token for same-session assembly when ambient budget is larger", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 10_000,
+      },
+    });
+    const sessionId = "ambient-reserve-one-token";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "current message should still assemble" } as AgentMessage,
+    });
+
+    const assembleSpy = vi.spyOn(
+      (engine as unknown as { assembler: { assemble: (...args: unknown[]) => Promise<unknown> } }).assembler,
+      "assemble",
+    );
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 8,
+    });
+
+    expect((assembleSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown })?.tokenBudget).toBe(1);
+  });
+
+  it("keeps assembly byte-equivalent to same-session output when cross-session is disabled", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: false,
+        totalBudget: 220,
+      },
+    });
+    const sessionId = "ambient-disabled-budget";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "alpha" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "beta" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const expected = await new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+    ).assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 600,
+      freshTailCount: 8,
+    });
+    const actual = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 600,
+    });
+
+    expect(JSON.stringify(actual.messages)).toBe(JSON.stringify(expected.messages));
+    expect(actual.estimatedTokens).toBe(expected.estimatedTokens);
+    expect((actual as { systemPromptAddition?: string }).systemPromptAddition).toBe(
+      expected.systemPromptAddition,
+    );
+  });
+
+  it("shows prior-session ambient beacons after reset only when cross-session is enabled", async () => {
+    const runtimeContext = {
+      agentScope: "agent-reset",
+      provider: "slack",
+      sourceLabel: "#standup",
+    };
+    const oldSessionId = "agent:agent-reset:before-reset";
+    const newSessionId = "agent:agent-reset:after-reset";
+
+    const enabledEngine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    await enabledEngine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("before-reset-enabled"),
+      messages: [makeMessage({ role: "assistant", content: "old-session project tracker updates" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await enabledEngine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("after-reset-enabled"),
+      messages: [makeMessage({ role: "assistant", content: "new-session kickoff after reset" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const enabledResult = await enabledEngine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const enabledAmbient = enabledResult.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(enabledAmbient).toHaveLength(1);
+    expect(enabledAmbient[0]).toContain("summary output");
+    expect(enabledAmbient[0]).toContain('source_label="#standup"');
+
+    const disabledEngine = createEngineWithConfig({
+      crossSession: {
+        enabled: false,
+        totalBudget: 400,
+      },
+    });
+    await disabledEngine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("before-reset-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "old-session project tracker updates" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await disabledEngine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("after-reset-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "new-session kickoff after reset" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const disabledResult = await disabledEngine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const disabledAmbient = disabledResult.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(disabledAmbient).toHaveLength(0);
+  });
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {
@@ -1740,6 +2165,422 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
       runtimeContext,
     );
+  });
+
+  it("afterTurn runs digest update after threshold compaction flow", async () => {
+    const { engine } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-order";
+    const callOrder: string[] = [];
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(engine, "compact").mockImplementation(async () => {
+      callOrder.push("compact");
+      return {
+        ok: true,
+        compacted: false,
+        reason: "below threshold",
+      };
+    });
+    vi.spyOn(engine as unknown as { updateDigest: (...args: unknown[]) => Promise<void> }, "updateDigest")
+      .mockImplementation(async () => {
+        callOrder.push("digest");
+      });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-order"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(callOrder).toEqual(["compact", "digest"]);
+  });
+
+  it("afterTurn skips digest update when cross-session is disabled", async () => {
+    const { engine } = createEngineWithDeps({
+      crossSession: {
+        enabled: false,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-disabled";
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    const digestSpy = vi.spyOn(
+      engine as unknown as { updateDigest: (...args: unknown[]) => Promise<void> },
+      "updateDigest",
+    );
+    const metadataSpy = vi.spyOn(
+      engine as unknown as { syncConversationMetadata: (...args: unknown[]) => Promise<void> },
+      "syncConversationMetadata",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-disabled"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(digestSpy).not.toHaveBeenCalled();
+    expect(metadataSpy).not.toHaveBeenCalled();
+  });
+
+  it("afterTurn syncs conversation metadata from runtimeContext for plain session ids", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-sync";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-sync"),
+      messages: [makeMessage({ role: "assistant", content: "metadata seed turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-metadata",
+        provider: "slack",
+        sourceLabel: "#alerts",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-metadata");
+    expect(conversation!.provider).toBe("slack");
+    expect(conversation!.sourceLabel).toBe("#alerts");
+  });
+
+  it("afterTurn preserves existing conversation metadata when runtimeContext is absent", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-preserve";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-preserve-seed"),
+      messages: [makeMessage({ role: "assistant", content: "metadata seed turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-preserve",
+        provider: "slack",
+        sourceLabel: "#alerts",
+      },
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-preserve-followup"),
+      messages: [makeMessage({ role: "assistant", content: "follow-up with no metadata" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-preserve");
+    expect(conversation!.provider).toBe("slack");
+    expect(conversation!.sourceLabel).toBe("#alerts");
+  });
+
+  it("afterTurn refreshes fallback conversation metadata when runtimeContext appears later", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-refresh";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-refresh-seed"),
+      messages: [makeMessage({ role: "assistant", content: "first turn without runtime metadata" })],
+      prePromptMessageCount: 0,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-refresh-followup"),
+      messages: [makeMessage({ role: "assistant", content: "follow-up with runtime metadata" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-runtime",
+        provider: "discord",
+        sourceLabel: "#ops-alerts",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-runtime");
+    expect(conversation!.provider).toBe("discord");
+    expect(conversation!.sourceLabel).toBe("#ops-alerts");
+  });
+
+  it("escapes ambient beacon attribute values", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    const oldSessionId = "escape-attrs-old";
+    const newSessionId = "escape-attrs-new";
+    const runtimeContext = {
+      agentScope: "agent-escape",
+      provider: 'acme "ops" & triage',
+      sourceLabel: 'channel <critical> "p1"',
+    };
+
+    await engine.afterTurn({
+      sessionId: oldSessionId,
+      sessionFile: createSessionFilePath("escape-attrs-old"),
+      messages: [makeMessage({ role: "assistant", content: "prior context for beacon" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+    await engine.afterTurn({
+      sessionId: newSessionId,
+      sessionFile: createSessionFilePath("escape-attrs-new"),
+      messages: [makeMessage({ role: "assistant", content: "current turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: newSessionId,
+      messages: [],
+      tokenBudget: 1200,
+    });
+    const ambient = assembled.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(1);
+    expect(ambient[0]).toContain('provider="acme &quot;ops&quot; &amp; triage"');
+    expect(ambient[0]).toContain('source_label="channel &lt;critical&gt; &quot;p1&quot;"');
+  });
+
+  it("creates an initial ambient digest beacon from scratch", async () => {
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-initial";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-initial"),
+      messages: [makeMessage({ role: "assistant", content: "initial work item" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "cpto",
+        provider: "slack",
+        sourceLabel: "#ops",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(0);
+    expect(digest!.agentScope).toBe("cpto");
+    expect(digest!.provider).toBe("slack");
+    expect(digest!.sourceLabel).toBe("#ops");
+    expect(digest!.tokenCount).toBeGreaterThan(0);
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    expect(completeMock).toHaveBeenCalledTimes(1);
+    const prompt = (completeMock.mock.calls[0]?.[0] as { messages?: Array<{ content?: unknown }> })
+      .messages?.[0]?.content;
+    expect(typeof prompt).toBe("string");
+    expect(prompt as string).toContain("ambient cross-session relevance beacon");
+    expect(prompt as string).toContain("Target length: 120-160 tokens. Hard cap: 180 tokens.");
+  });
+
+  it("updates digest incrementally using only context added after last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-incremental";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-incremental-1"),
+      messages: [makeMessage({ role: "assistant", content: "first update" })],
+      prePromptMessageCount: 0,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-incremental-2"),
+      messages: [makeMessage({ role: "assistant", content: "second update" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(1);
+    expect(digest!.earliestAt).not.toBeNull();
+    expect(digest!.latestAt).not.toBeNull();
+    expect((digest!.latestAt as Date).getTime()).toBeGreaterThanOrEqual(
+      (digest!.earliestAt as Date).getTime(),
+    );
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    expect(completeMock).toHaveBeenCalledTimes(2);
+    const secondPrompt = (
+      completeMock.mock.calls[1]?.[0] as { messages?: Array<{ content?: unknown }> }
+    ).messages?.[0]?.content;
+    expect(typeof secondPrompt).toBe("string");
+    expect(secondPrompt as string).toContain("<previous_beacon>");
+    expect(secondPrompt as string).toContain("[ord:1]");
+    expect(secondPrompt as string).not.toContain("[ord:0]");
+  });
+
+  it("rewinds digest checkpoint when context ordinals are resequenced below last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-resequence-rewind";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-resequence-rewind-1"),
+      messages: [makeMessage({ role: "assistant", content: "first update" })],
+      prePromptMessageCount: 0,
+    });
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-resequence-rewind-2"),
+      messages: [makeMessage({ role: "assistant", content: "second update" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const summaryId = `sum_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await engine.getSummaryStore().insertSummary({
+      summaryId,
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "compacted replacement",
+      tokenCount: 8,
+      descendantCount: 2,
+    });
+    await engine.getSummaryStore().replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId,
+    });
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    const callCountBefore = completeMock.mock.calls.length;
+
+    await (engine as unknown as { updateDigest: (input: unknown) => Promise<void> }).updateDigest({
+      conversationId: conversation!.conversationId,
+      sessionId,
+      legacyParams: undefined,
+    });
+
+    expect(completeMock.mock.calls.length).toBe(callCountBefore + 1);
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(0);
+  });
+
+  it("skips digest regeneration when no context items exist beyond last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-noop";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-noop"),
+      messages: [makeMessage({ role: "assistant", content: "seed digest" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const before = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(before).not.toBeNull();
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    const callCountBefore = completeMock.mock.calls.length;
+
+    await (engine as unknown as { updateDigest: (input: unknown) => Promise<void> }).updateDigest({
+      conversationId: conversation!.conversationId,
+      sessionId,
+      legacyParams: undefined,
+    });
+
+    const after = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(after).not.toBeNull();
+    expect(completeMock.mock.calls.length).toBe(callCountBefore);
+    expect(after!.digestText).toBe(before!.digestText);
+    expect(after!.updatedAt.getTime()).toBe(before!.updatedAt.getTime());
   });
 });
 
