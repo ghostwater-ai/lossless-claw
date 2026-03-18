@@ -568,6 +568,19 @@ export class SummaryStore {
     return rows.map(toContextDigestSourceItem);
   }
 
+  async getMaxContextOrdinal(conversationId: number): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items
+       WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxOrdinalRow | undefined;
+    return typeof row?.max_ordinal === "number" && Number.isFinite(row.max_ordinal)
+      ? Math.floor(row.max_ordinal)
+      : -1;
+  }
+
   async getDistinctDepthsInContext(
     conversationId: number,
     options?: { maxOrdinalExclusive?: number },

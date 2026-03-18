@@ -1213,6 +1213,83 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(firstAmbientIndex).toBeGreaterThan(0);
   });
 
+  it("continues packing ambient beacons after skipping an oversized recent beacon", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 220,
+      },
+    });
+    const scope = "agent-pack";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:current",
+      sessionFile: createSessionFilePath("ambient-pack-current"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "slack", sourceLabel: "#current" },
+    });
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:oversized",
+      sessionFile: createSessionFilePath("ambient-pack-oversized"),
+      messages: [makeMessage({ role: "assistant", content: "oversized source" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "email", sourceLabel: "too-large" },
+    });
+    await engine.afterTurn({
+      sessionId: "agent:agent-pack:small",
+      sessionFile: createSessionFilePath("ambient-pack-small"),
+      messages: [makeMessage({ role: "assistant", content: "small source" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scope, provider: "discord", sourceLabel: "fits" },
+    });
+
+    const store = engine.getConversationStore();
+    const oversized = await store.getConversationBySessionId("agent:agent-pack:oversized");
+    const small = await store.getConversationBySessionId("agent:agent-pack:small");
+    expect(oversized).not.toBeNull();
+    expect(small).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: oversized!.conversationId,
+      agentScope: scope,
+      provider: "email",
+      sourceLabel: "too-large",
+      digestText: "oversized ".repeat(200).trim(),
+      tokenCount: 200,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-17T09:00:00.000Z"),
+      latestAt: new Date("2026-03-17T09:01:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: small!.conversationId,
+      agentScope: scope,
+      provider: "discord",
+      sourceLabel: "fits",
+      digestText: "small ".repeat(8).trim(),
+      tokenCount: 8,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-16T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:01:00.000Z"),
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: "agent:agent-pack:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+    const ambient = assembled.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(1);
+    expect(ambient[0]).toContain('source_label="fits"');
+    expect(ambient.join("\n")).not.toContain("too-large");
+  });
+
   it("keeps assembly byte-equivalent to same-session output when ambient budget is zero", async () => {
     const engine = createEngineWithConfig({
       crossSession: {
@@ -1252,6 +1329,33 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect((actual as { systemPromptAddition?: string }).systemPromptAddition).toBe(
       expected.systemPromptAddition,
     );
+  });
+
+  it("reserves at least one token for same-session assembly when ambient budget is larger", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 10_000,
+      },
+    });
+    const sessionId = "ambient-reserve-one-token";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "current message should still assemble" } as AgentMessage,
+    });
+
+    const assembleSpy = vi.spyOn(
+      (engine as unknown as { assembler: { assemble: (...args: unknown[]) => Promise<unknown> } }).assembler,
+      "assemble",
+    );
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 8,
+    });
+
+    expect((assembleSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown })?.tokenBudget).toBe(1);
   });
 
   it("keeps assembly byte-equivalent to same-session output when cross-session is disabled", async () => {
@@ -2125,6 +2229,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       engine as unknown as { updateDigest: (...args: unknown[]) => Promise<void> },
       "updateDigest",
     );
+    const metadataSpy = vi.spyOn(
+      engine as unknown as { syncConversationMetadata: (...args: unknown[]) => Promise<void> },
+      "syncConversationMetadata",
+    );
 
     await engine.afterTurn({
       sessionId,
@@ -2135,6 +2243,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
 
     expect(digestSpy).not.toHaveBeenCalled();
+    expect(metadataSpy).not.toHaveBeenCalled();
   });
 
   it("afterTurn syncs conversation metadata from runtimeContext for plain session ids", async () => {
@@ -2161,6 +2270,41 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
     expect(conversation!.agentScope).toBe("agent-metadata");
+    expect(conversation!.provider).toBe("slack");
+    expect(conversation!.sourceLabel).toBe("#alerts");
+  });
+
+  it("afterTurn preserves existing conversation metadata when runtimeContext is absent", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-preserve";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-preserve-seed"),
+      messages: [makeMessage({ role: "assistant", content: "metadata seed turn" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-preserve",
+        provider: "slack",
+        sourceLabel: "#alerts",
+      },
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-preserve-followup"),
+      messages: [makeMessage({ role: "assistant", content: "follow-up with no metadata" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-preserve");
     expect(conversation!.provider).toBe("slack");
     expect(conversation!.sourceLabel).toBe("#alerts");
   });
@@ -2301,6 +2445,65 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(secondPrompt as string).toContain("<previous_beacon>");
     expect(secondPrompt as string).toContain("[ord:1]");
     expect(secondPrompt as string).not.toContain("[ord:0]");
+  });
+
+  it("rewinds digest checkpoint when context ordinals are resequenced below last_context_ord", async () => {
+    const { engine, deps } = createEngineWithDeps({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "after-turn-digest-resequence-rewind";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-resequence-rewind-1"),
+      messages: [makeMessage({ role: "assistant", content: "first update" })],
+      prePromptMessageCount: 0,
+    });
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-digest-resequence-rewind-2"),
+      messages: [makeMessage({ role: "assistant", content: "second update" })],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const summaryId = `sum_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await engine.getSummaryStore().insertSummary({
+      summaryId,
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "compacted replacement",
+      tokenCount: 8,
+      descendantCount: 2,
+    });
+    await engine.getSummaryStore().replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId,
+    });
+
+    const completeMock = deps.complete as unknown as ReturnType<typeof vi.fn>;
+    const callCountBefore = completeMock.mock.calls.length;
+
+    await (engine as unknown as { updateDigest: (input: unknown) => Promise<void> }).updateDigest({
+      conversationId: conversation!.conversationId,
+      sessionId,
+      legacyParams: undefined,
+    });
+
+    expect(completeMock.mock.calls.length).toBe(callCountBefore + 1);
+    const digest = await engine
+      .getConversationStore()
+      .getConversationDigest(conversation!.conversationId);
+    expect(digest).not.toBeNull();
+    expect(digest!.lastContextOrd).toBe(0);
   });
 
   it("skips digest regeneration when no context items exist beyond last_context_ord", async () => {

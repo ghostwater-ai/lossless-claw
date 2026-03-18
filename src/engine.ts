@@ -971,11 +971,12 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     legacyParams?: Record<string, unknown>;
   }): Promise<void> {
+    const existing = await this.conversationStore.getConversationBySessionId(params.sessionId);
     const metadata = this.resolveBeaconMetadata({
       sessionId: params.sessionId,
-      conversationAgentScope: null,
-      conversationProvider: null,
-      conversationSourceLabel: null,
+      conversationAgentScope: existing?.agentScope ?? null,
+      conversationProvider: existing?.provider ?? null,
+      conversationSourceLabel: existing?.sourceLabel ?? null,
       legacyParams: params.legacyParams,
     });
     await this.conversationStore.getOrCreateConversation(params.sessionId, undefined, {
@@ -1003,9 +1004,12 @@ export class LcmContextEngine implements ContextEngine {
       legacyParams: params.legacyParams,
     });
     const existing = await this.conversationStore.getConversationDigest(params.conversationId);
+    const latestContextOrdinal = await this.summaryStore.getMaxContextOrdinal(params.conversationId);
+    const lastContextOrd =
+      existing && existing.lastContextOrd > latestContextOrdinal ? -1 : (existing?.lastContextOrd ?? -1);
     const newItems = await this.summaryStore.getContextItemsSinceOrdinal(
       params.conversationId,
-      existing?.lastContextOrd ?? -1,
+      lastContextOrd,
     );
     if (newItems.length === 0) {
       return;
@@ -1510,15 +1514,6 @@ export class LcmContextEngine implements ContextEngine {
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
 
-    try {
-      await this.syncConversationMetadata({
-        sessionId: params.sessionId,
-        legacyParams,
-      });
-    } catch {
-      // Metadata sync is best-effort in the post-turn lifecycle.
-    }
-
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     if (tokenBudget) {
@@ -1554,6 +1549,15 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (this.config.crossSession.enabled === true) {
+      try {
+        await this.syncConversationMetadata({
+          sessionId: params.sessionId,
+          legacyParams,
+        });
+      } catch {
+        // Metadata sync is best-effort in the post-turn lifecycle.
+      }
+
       try {
         const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
         if (conversation) {
@@ -1618,7 +1622,7 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.max(
               0,
               Math.min(
-                tokenBudget,
+                Math.max(0, tokenBudget - 1),
                 Number.isFinite(this.config.crossSession.totalBudget)
                   ? Math.floor(this.config.crossSession.totalBudget)
                   : 0,
@@ -1696,7 +1700,7 @@ export class LcmContextEngine implements ContextEngine {
       const block = formatAmbientBeaconBlock(digest);
       const blockTokens = estimateTokens(block);
       if (estimatedTokens + blockTokens > tokenBudget) {
-        break;
+        continue;
       }
       estimatedTokens += blockTokens;
       selected.push({
