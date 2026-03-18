@@ -50,8 +50,9 @@ const BEACON_TARGET_TOKENS = 140;
 const BEACON_HARD_TOKEN_CAP = 180;
 const BEACON_SUMMARIZER_INSTRUCTIONS = [
   "Produce an ambient relevance beacon for cross-session routing.",
+  "Lead with what this session IS ABOUT — its purpose and domain (e.g. 'Soulforge workflow engine development', 'Nexus analytics dashboard deployment').",
+  "Then add the most relevant recent context: latest direction change, key decision, or open blocker.",
   "Keep it concise and discriminative, not a narrative retelling.",
-  "Include topic/project identity, latest direction change, and one key decision/blocker/open question.",
   "Aim for 120-160 tokens. Do not exceed ~180 tokens.",
 ].join(" ");
 
@@ -938,12 +939,18 @@ export class LcmContextEngine implements ContextEngine {
   }): { agentScope: string; provider: string | null; sourceLabel: string | null } {
     const lp = params.legacyParams ?? {};
     const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+    // PATCHED: also try parsing sessionKey from runtimeContext (OpenClaw passes
+    // sessionKey like "agent:cpto:slack:channel:xxx" which embeds the agentId)
+    const parsedFromKey = safeString(lp.sessionKey)
+      ? this.deps.parseAgentSessionKey(safeString(lp.sessionKey)!)
+      : null;
 
     const agentScope =
       safeString(lp.agentScope) ??
       safeString(lp.agent_scope) ??
       safeString(lp.agentId) ??
       safeString(lp.agent_id) ??
+      (parsedFromKey ? this.deps.normalizeAgentId(parsedFromKey.agentId) : null) ??
       params.conversationAgentScope ??
       (parsed ? this.deps.normalizeAgentId(parsed.agentId) : this.deps.normalizeAgentId(undefined));
     const provider =
@@ -958,6 +965,7 @@ export class LcmContextEngine implements ContextEngine {
       safeString(lp.channelLabel) ??
       safeString(lp.channel_label) ??
       params.conversationSourceLabel ??
+      (parsedFromKey ? parsedFromKey.suffix : null) ??
       (parsed ? parsed.suffix : null);
 
     return {
@@ -1549,26 +1557,34 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (this.config.crossSession.enabled === true) {
-      try {
-        await this.syncConversationMetadata({
-          sessionId: params.sessionId,
-          legacyParams,
-        });
-      } catch {
-        // Metadata sync is best-effort in the post-turn lifecycle.
-      }
+      // Skip digest generation for subagent sessions — they're internal
+      // implementation details whose outcomes are captured by the parent
+      // session's beacon. Avoids noise in the ambient context budget.
+      const sessionKey = safeString(legacyParams?.sessionKey) ?? params.sessionId;
+      const isSubagent = this.deps.isSubagentSessionKey(sessionKey);
 
-      try {
-        const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
-        if (conversation) {
-          await this.updateDigest({
-            conversationId: conversation.conversationId,
+      if (!isSubagent) {
+        try {
+          await this.syncConversationMetadata({
             sessionId: params.sessionId,
             legacyParams,
           });
+        } catch {
+          // Metadata sync is best-effort in the post-turn lifecycle.
         }
-      } catch {
-        // Digest refresh is best-effort in the post-turn lifecycle.
+
+        try {
+          const conversation = await this.conversationStore.getConversationBySessionId(params.sessionId);
+          if (conversation) {
+            await this.updateDigest({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              legacyParams,
+            });
+          }
+        } catch {
+          // Digest refresh is best-effort in the post-turn lifecycle.
+        }
       }
     }
   }
