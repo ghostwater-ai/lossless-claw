@@ -3,7 +3,7 @@
   "uiHints": {
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+      "help": "Fraction of context window that triggers compaction (0.0\u20131.0)"
     },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
@@ -111,6 +111,23 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "crossSession": {
+        "type": "object",
+        "description": "Cross-session ambient beacon configuration",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable cross-session ambient beacons",
+            "default": false
+          },
+          "totalBudget": {
+            "type": "number",
+            "description": "Token budget for ambient cross-session context",
+            "default": 10000
+          }
+        },
+        "additionalProperties": false
       }
     }
   }
