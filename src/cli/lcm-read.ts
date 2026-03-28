@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { formatListTable, listConversations, parseListOptions, resolveDbPath } from "./lcm-read-list.js";
@@ -152,7 +152,7 @@ function main(): void {
   }
 }
 
-const entryUrl = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
+const entryUrl = process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : "";
 if (import.meta.url === entryUrl) {
   main();
 }
